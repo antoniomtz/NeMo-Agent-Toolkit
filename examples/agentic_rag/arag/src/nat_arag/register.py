@@ -25,6 +25,7 @@ from nat.builder.framework_enum import LLMFrameworkEnum
 from nat.builder.function_info import FunctionInfo
 from nat.cli.register_workflow import register_function
 from nat.data_models.component_ref import FunctionRef
+from nat.data_models.component_ref import LLMRef
 from nat.data_models.function import FunctionBaseConfig
 
 logger = logging.getLogger(__name__)
@@ -99,11 +100,13 @@ async def parallel_execution(config: ParallelExecutorConfig, builder: Builder):
 
 
 # =============================================================================
-# ARAG Agent Functions (mock implementations for demonstration)
+# ARAG Agent Functions — each agent is backed by an LLM
 # =============================================================================
 
 
 # -- 1. RAG Retriever --------------------------------------------------------
+# The retriever simulates a vector-store lookup (Milvus, FAISS, etc.).
+# In production, replace with a real nat_retriever + embedder.
 
 
 class RAGRetrieverConfig(FunctionBaseConfig, name="rag_retriever"):
@@ -114,14 +117,14 @@ class RAGRetrieverConfig(FunctionBaseConfig, name="rag_retriever"):
 
 @register_function(config_type=RAGRetrieverConfig, framework_wrappers=[LLMFrameworkEnum.LANGCHAIN])
 async def rag_retriever_function(config: RAGRetrieverConfig, builder: Builder):
-    """Retrieve an initial recall set of candidate items via RAG."""
+    """Retrieve an initial recall set of candidate items via RAG.
+
+    Note: This uses mock data to demonstrate the pipeline data flow.
+    In production, wire this to a real retriever (e.g. milvus_retriever).
+    """
 
     async def retrieve_candidates(user_query: str) -> str:
         """Simulate RAG retrieval of candidate items.
-
-        In a real implementation this would query a vector store (e.g. Milvus)
-        and return the top-k results.  Here we return mock data to illustrate
-        the data flow.
 
         Args:
             user_query: The user's recommendation request.
@@ -172,30 +175,64 @@ async def rag_retriever_function(config: RAGRetrieverConfig, builder: Builder):
             "candidates": candidates[:config.top_k],
         }
 
-        logger.info("RAG Retriever: retrieved %d candidates for query: %s", len(candidates), user_query)
+        logger.info("RAG Retriever: retrieved %d candidates for query: %s",
+                     len(retrieval_result["candidates"]), user_query)
         return json.dumps(retrieval_result)
 
     yield FunctionInfo.from_fn(retrieve_candidates, description="Retrieve candidate items using RAG")
 
 
-# -- 2. NLI Agent ------------------------------------------------------------
+# -- 2. NLI Agent (LLM-backed) -----------------------------------------------
 
 
 class NLIAgentConfig(FunctionBaseConfig, name="nli_agent"):
     """Configuration for the NLI (Natural Language Inference) agent."""
-    pass
+
+    llm_name: LLMRef = Field(description="The LLM to use for NLI evaluation.")
 
 
 @register_function(config_type=NLIAgentConfig, framework_wrappers=[LLMFrameworkEnum.LANGCHAIN])
 async def nli_agent_function(config: NLIAgentConfig, builder: Builder):
-    """Evaluate semantic alignment between candidate items and inferred user intent."""
+    """Evaluate semantic alignment between candidate items and inferred user intent using an LLM."""
+
+    from langchain_core.prompts.chat import ChatPromptTemplate
+
+    llm = await builder.get_llm(config.llm_name, wrapper_type=LLMFrameworkEnum.LANGCHAIN)
+
+    system_prompt = """\
+You are a Natural Language Inference (NLI) agent for a recommendation system.
+
+Given a user query and a list of candidate items, evaluate how well each item \
+aligns with the user's intent. For each item, produce:
+- "nli_label": one of "entailment" (strong match), "neutral" (partial match), \
+or "contradiction" (poor match).
+- "nli_score": a float between 0.0 and 1.0 indicating alignment strength.
+- "reasoning": a brief explanation of why the item does or does not match.
+
+Respond with ONLY a valid JSON object in this exact format:
+{{
+  "user_query": "<the original query>",
+  "scored_candidates": [
+    {{
+      "id": "<item id>",
+      "title": "<item title>",
+      "description": "<item description>",
+      "category": "<item category>",
+      "reviews_summary": "<item reviews>",
+      "nli_label": "entailment | neutral | contradiction",
+      "nli_score": <0.0-1.0>,
+      "reasoning": "<brief explanation>"
+    }}
+  ]
+}}"""
+
+    user_prompt = "{input}"
+
+    prompt = ChatPromptTemplate.from_messages([("system", system_prompt), ("user", user_prompt)])
+    chain = prompt | llm
 
     async def evaluate_nli(retrieval_result: str) -> str:
-        """Score each candidate item's alignment with the user's intent.
-
-        In a real implementation this would call an LLM to perform NLI
-        (entailment / contradiction / neutral) between user intent and each
-        item's metadata.
+        """Use an LLM to perform NLI scoring on each candidate item.
 
         Args:
             retrieval_result: JSON string with user_query and candidates from RAG.
@@ -203,104 +240,120 @@ async def nli_agent_function(config: NLIAgentConfig, builder: Builder):
         Returns:
             JSON string with NLI-scored candidates.
         """
-        data = json.loads(retrieval_result)
-        user_query = data.get("user_query", "")
-        candidates = data.get("candidates", [])
-
-        query_lower = user_query.lower()
-        scored_candidates = []
-        for item in candidates:
-            # Mock NLI scoring based on keyword overlap
-            text = f"{item['title']} {item['description']} {item.get('reviews_summary', '')}".lower()
-            query_words = set(query_lower.split())
-            text_words = set(text.split())
-            overlap = len(query_words & text_words)
-            nli_score = min(1.0, overlap / max(len(query_words), 1) * 0.8 + 0.2)
-
-            scored_candidates.append({
-                **item,
-                "nli_score": round(nli_score, 3),
-                "nli_label": "entailment" if nli_score > 0.6 else "neutral",
-            })
-
-        nli_result = {
-            "user_query": user_query,
-            "scored_candidates": scored_candidates,
-        }
-
-        logger.info("NLI Agent: scored %d candidates", len(scored_candidates))
-        return json.dumps(nli_result)
+        response = await chain.ainvoke({"input": retrieval_result})
+        logger.info("NLI Agent: completed LLM-based evaluation")
+        return response.text()
 
     yield FunctionInfo.from_fn(evaluate_nli, description="Evaluate NLI alignment between candidates and user intent")
 
 
-# -- 3. Context Summary Agent ------------------------------------------------
+# -- 3. Context Summary Agent (LLM-backed) -----------------------------------
 
 
 class ContextSummaryAgentConfig(FunctionBaseConfig, name="context_summary_agent"):
     """Configuration for the context summary agent."""
-    pass
+
+    llm_name: LLMRef = Field(description="The LLM to use for context summarization.")
 
 
 @register_function(config_type=ContextSummaryAgentConfig, framework_wrappers=[LLMFrameworkEnum.LANGCHAIN])
 async def context_summary_agent_function(config: ContextSummaryAgentConfig, builder: Builder):
-    """Summarize the NLI findings into concise context for the ranker."""
+    """Summarize NLI findings into concise context for the ranker using an LLM."""
+
+    from langchain_core.prompts.chat import ChatPromptTemplate
+
+    llm = await builder.get_llm(config.llm_name, wrapper_type=LLMFrameworkEnum.LANGCHAIN)
+
+    system_prompt = """\
+You are a Context Summary agent for a recommendation system.
+
+You receive the output of an NLI (Natural Language Inference) evaluation that \
+scored candidate items against a user's query. Your job is to produce a concise \
+natural-language summary that a downstream Item Ranker agent can use.
+
+Your summary must include:
+1. The original user query.
+2. How many candidates were evaluated and the breakdown by NLI label \
+(entailment / neutral / contradiction).
+3. The key themes or attributes that made top items align with the query.
+4. Any notable mismatches or gaps in the candidate set.
+
+Respond with ONLY a valid JSON object in this exact format:
+{{
+  "summary": "<your natural language summary paragraph>",
+  "top_aligned_items": ["<title1>", "<title2>", ...],
+  "key_themes": ["<theme1>", "<theme2>", ...],
+  "gaps": "<any gaps or missing categories noted>"
+}}"""
+
+    user_prompt = "{input}"
+
+    prompt = ChatPromptTemplate.from_messages([("system", system_prompt), ("user", user_prompt)])
+    chain = prompt | llm
 
     async def summarize_context(nli_result: str) -> str:
-        """Produce a natural-language context summary from NLI-scored candidates.
+        """Use an LLM to summarize NLI-scored candidates into context.
 
         Args:
             nli_result: JSON string with NLI-scored candidates.
 
         Returns:
-            JSON string containing the context summary and supporting items.
+            JSON string containing the context summary.
         """
-        data = json.loads(nli_result)
-        scored = data.get("scored_candidates", [])
-
-        entailed = [c for c in scored if c.get("nli_label") == "entailment"]
-        neutral = [c for c in scored if c.get("nli_label") == "neutral"]
-
-        summary_lines = [
-            f"Query: {data.get('user_query', 'N/A')}",
-            f"Total candidates evaluated: {len(scored)}",
-            f"Strong matches (entailment): {len(entailed)}",
-            f"Weak matches (neutral): {len(neutral)}",
-        ]
-
-        if entailed:
-            top_items = sorted(entailed, key=lambda x: x["nli_score"], reverse=True)[:3]
-            summary_lines.append("Top aligned items: " + ", ".join(i["title"] for i in top_items))
-
-        context_summary = {
-            "summary": " | ".join(summary_lines),
-            "entailed_items": entailed,
-            "neutral_items": neutral,
-        }
-
-        logger.info("Context Summary Agent: %d entailed, %d neutral", len(entailed), len(neutral))
-        return json.dumps(context_summary)
+        response = await chain.ainvoke({"input": nli_result})
+        logger.info("Context Summary Agent: completed LLM-based summarization")
+        return response.text()
 
     yield FunctionInfo.from_fn(summarize_context, description="Summarize NLI findings into concise context")
 
 
-# -- 4. User Understanding Agent ---------------------------------------------
+# -- 4. User Understanding Agent (LLM-backed) --------------------------------
 
 
 class UserUnderstandingAgentConfig(FunctionBaseConfig, name="user_understanding_agent"):
     """Configuration for the user understanding agent."""
-    pass
+
+    llm_name: LLMRef = Field(description="The LLM to use for user preference analysis.")
 
 
 @register_function(config_type=UserUnderstandingAgentConfig, framework_wrappers=[LLMFrameworkEnum.LANGCHAIN])
 async def user_understanding_agent_function(config: UserUnderstandingAgentConfig, builder: Builder):
-    """Generate a user preference summary from session and long-term context."""
+    """Generate a user preference summary from session and long-term context using an LLM."""
+
+    from langchain_core.prompts.chat import ChatPromptTemplate
+
+    llm = await builder.get_llm(config.llm_name, wrapper_type=LLMFrameworkEnum.LANGCHAIN)
+
+    system_prompt = """\
+You are a User Understanding agent for a personalized recommendation system.
+
+Given a user's query and the set of candidate items retrieved by RAG, infer \
+the user's preferences, interests, and intent. Think about:
+- What product categories the user cares about.
+- What attributes matter most (price, quality, brand, features, etc.).
+- Whether the query implies short-term (session) needs or long-term interests.
+- Any implicit constraints (budget, use-case, lifestyle).
+
+Respond with ONLY a valid JSON object in this exact format:
+{{
+  "user_query": "<the original query>",
+  "preference_summary": "<a natural language paragraph summarizing the user's preferences>",
+  "inferred_interests": {{
+    "primary_category": "<main product category>",
+    "key_attributes": ["<attr1>", "<attr2>", ...],
+    "use_case": "<inferred use case>",
+    "price_sensitivity": "low | medium | high",
+    "session_vs_longterm": "session | longterm | both"
+  }}
+}}"""
+
+    user_prompt = "{input}"
+
+    prompt = ChatPromptTemplate.from_messages([("system", system_prompt), ("user", user_prompt)])
+    chain = prompt | llm
 
     async def understand_user(retrieval_result: str) -> str:
-        """Analyze the user's query and interaction context to infer preferences.
-
-        In a real implementation this would look at the user's session history
-        and long-term profile.  Here we simulate preference extraction.
+        """Use an LLM to analyze user intent and infer preferences.
 
         Args:
             retrieval_result: JSON string with user_query and candidates from RAG.
@@ -308,121 +361,78 @@ async def user_understanding_agent_function(config: UserUnderstandingAgentConfig
         Returns:
             JSON string with inferred user preferences.
         """
-        data = json.loads(retrieval_result)
-        user_query = data.get("user_query", "")
-
-        # Mock user preference inference based on the query
-        query_lower = user_query.lower()
-        inferred_preferences = {
-            "primary_interest": "technology" if any(
-                kw in query_lower for kw in ["tech", "gadget", "electronic", "computer"]
-            ) else "general",
-            "price_sensitivity": "medium",
-            "brand_affinity": "none detected",
-            "preferred_categories": [],
-        }
-
-        # Infer categories from query keywords
-        category_keywords = {
-            "electronics": ["headphone", "speaker", "watch", "keyboard", "phone", "laptop", "tech", "gadget"],
-            "furniture": ["chair", "desk", "office", "ergonomic"],
-            "fitness": ["fitness", "exercise", "health", "workout", "sport"],
-        }
-        for category, keywords in category_keywords.items():
-            if any(kw in query_lower for kw in keywords):
-                inferred_preferences["preferred_categories"].append(category)
-
-        if not inferred_preferences["preferred_categories"]:
-            inferred_preferences["preferred_categories"] = ["electronics"]
-
-        user_profile = {
-            "user_query": user_query,
-            "session_preferences": inferred_preferences,
-            "preference_summary": (
-                f"User is interested in {inferred_preferences['primary_interest']} products, "
-                f"specifically in categories: {', '.join(inferred_preferences['preferred_categories'])}. "
-                f"Price sensitivity: {inferred_preferences['price_sensitivity']}."
-            ),
-        }
-
-        logger.info("User Understanding Agent: inferred preferences for query: %s", user_query)
-        return json.dumps(user_profile)
+        response = await chain.ainvoke({"input": retrieval_result})
+        logger.info("User Understanding Agent: completed LLM-based preference analysis")
+        return response.text()
 
     yield FunctionInfo.from_fn(understand_user, description="Generate user preference summary from session context")
 
 
-# -- 5. Item Ranker Agent -----------------------------------------------------
+# -- 5. Item Ranker Agent (LLM-backed) ---------------------------------------
 
 
 class ItemRankerAgentConfig(FunctionBaseConfig, name="item_ranker_agent"):
     """Configuration for the item ranker agent."""
-    pass
+
+    llm_name: LLMRef = Field(description="The LLM to use for final item ranking.")
 
 
 @register_function(config_type=ItemRankerAgentConfig, framework_wrappers=[LLMFrameworkEnum.LANGCHAIN])
 async def item_ranker_agent_function(config: ItemRankerAgentConfig, builder: Builder):
-    """Rank items based on combined NLI context and user understanding signals."""
+    """Rank items based on combined NLI context and user understanding signals using an LLM."""
+
+    from langchain_core.prompts.chat import ChatPromptTemplate
+
+    llm = await builder.get_llm(config.llm_name, wrapper_type=LLMFrameworkEnum.LANGCHAIN)
+
+    system_prompt = """\
+You are an Item Ranker agent for a personalized recommendation system.
+
+You receive two inputs merged into a single JSON object with two keys:
+1. **NLI pipeline output** — a context summary of how well candidate items \
+align with the user's query (includes NLI labels, scores, and themes).
+2. **User understanding output** — an analysis of the user's preferences, \
+interests, and intent.
+
+Your task is to combine both signals and produce a final **ranked list** of \
+recommended items, ordered from most relevant to least relevant.
+
+For each item, explain briefly why it was ranked at that position, referencing \
+both the NLI alignment and the user's preferences.
+
+Respond with ONLY a valid JSON object in this exact format:
+{{
+  "ranked_recommendations": [
+    {{
+      "rank": 1,
+      "title": "<item title>",
+      "category": "<item category>",
+      "relevance_score": <0.0-1.0>,
+      "reasoning": "<why this item is ranked here, referencing NLI + user prefs>"
+    }}
+  ],
+  "summary": "<a brief paragraph summarizing the overall recommendation rationale>"
+}}"""
+
+    user_prompt = "{input}"
+
+    prompt = ChatPromptTemplate.from_messages([("system", system_prompt), ("user", user_prompt)])
+    chain = prompt | llm
 
     async def rank_items(parallel_results: str) -> str:
-        """Produce a final ranked list by integrating context summary and user preferences.
+        """Use an LLM to produce a final ranked recommendation list.
 
-        The input is the merged output from the parallel executor, which
-        contains both the NLI pipeline context summary and the user
-        understanding profile keyed by their tool names.
+        The input is the merged output from the parallel executor containing
+        both the NLI pipeline context summary and the user understanding profile.
 
         Args:
             parallel_results: JSON string with merged parallel branch outputs.
 
         Returns:
-            Formatted ranked recommendation list.
+            JSON string with ranked recommendations.
         """
-        branches = json.loads(parallel_results)
-
-        # Parse the NLI pipeline output (context summary)
-        context_data = {}
-        user_data = {}
-        for key, value in branches.items():
-            parsed = json.loads(value) if isinstance(value, str) else value
-            if "entailed_items" in parsed or "summary" in parsed:
-                context_data = parsed
-            elif "session_preferences" in parsed or "preference_summary" in parsed:
-                user_data = parsed
-
-        # Combine signals to produce final ranking
-        entailed_items = context_data.get("entailed_items", [])
-        neutral_items = context_data.get("neutral_items", [])
-        all_items = entailed_items + neutral_items
-
-        preferred_categories = (
-            user_data.get("session_preferences", {}).get("preferred_categories", [])
-        )
-
-        # Score items by combining NLI score + category preference bonus
-        for item in all_items:
-            nli_score = item.get("nli_score", 0.0)
-            category_bonus = 0.15 if item.get("category") in preferred_categories else 0.0
-            item["final_score"] = round(nli_score + category_bonus, 3)
-
-        ranked = sorted(all_items, key=lambda x: x["final_score"], reverse=True)
-
-        # Format the output
-        report_lines = [
-            "=== ARAG Personalized Recommendations ===",
-            "",
-            f"User Preferences: {user_data.get('preference_summary', 'N/A')}",
-            f"Context: {context_data.get('summary', 'N/A')}",
-            "",
-            "Ranked Items:",
-        ]
-        for rank, item in enumerate(ranked, 1):
-            report_lines.append(
-                f"  {rank}. [{item['final_score']:.3f}] {item['title']} "
-                f"(NLI: {item.get('nli_label', 'N/A')}, Category: {item.get('category', 'N/A')})"
-            )
-
-        report_lines.extend(["", "=== End of Recommendations ==="])
-
-        logger.info("Item Ranker Agent: produced ranking of %d items", len(ranked))
-        return "\n".join(report_lines)
+        response = await chain.ainvoke({"input": parallel_results})
+        logger.info("Item Ranker Agent: completed LLM-based ranking")
+        return response.text()
 
     yield FunctionInfo.from_fn(rank_items, description="Rank items using combined NLI context and user preferences")
