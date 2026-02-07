@@ -25,7 +25,11 @@
 #
 # The parallel_executor fans out the RAG output to two branches that run
 # concurrently, then merges their results for the final Item Ranker step.
-# Every LLM-backed agent uses the same model, configured below.
+#
+# All four LLM agents use the built-in chat_completion type — their entire
+# behaviour is defined by the system_prompt below.  No custom Python code
+# is needed for any LLM agent; only the RAG retriever (mock data source)
+# and the parallel_executor (new control-flow component) require register.py.
 
 llms:
   nim_llm:
@@ -35,32 +39,134 @@ llms:
     max_tokens: 4096
 
 functions:
-  # -- Core ARAG agents (each backed by the LLM) ------------------------------
+  # -- Step 1: RAG Retriever (mock — requires custom code) --------------------
 
   rag_retriever:
     _type: rag_retriever
     top_k: 5
     description: "Retrieve initial candidate items using RAG"
 
+  # -- Step 2a: NLI Agent (pure YAML via chat_completion) ---------------------
+
   nli_agent:
-    _type: nli_agent
+    _type: chat_completion
     llm_name: nim_llm
-    description: "Evaluate semantic alignment between candidates and user intent"
+    system_prompt: |
+      You are a Natural Language Inference (NLI) agent for a recommendation system.
+
+      Given a user query and a list of candidate items, evaluate how well each
+      item aligns with the user's intent. For each item, produce:
+      - "nli_label": one of "entailment" (strong match), "neutral" (partial
+        match), or "contradiction" (poor match).
+      - "nli_score": a float between 0.0 and 1.0 indicating alignment strength.
+      - "reasoning": a brief explanation of why the item does or does not match.
+
+      Respond with ONLY a valid JSON object in this exact format:
+      {
+        "user_query": "<the original query>",
+        "scored_candidates": [
+          {
+            "id": "<item id>",
+            "title": "<item title>",
+            "description": "<item description>",
+            "category": "<item category>",
+            "reviews_summary": "<item reviews>",
+            "nli_label": "entailment | neutral | contradiction",
+            "nli_score": 0.0,
+            "reasoning": "<brief explanation>"
+          }
+        ]
+      }
+
+  # -- Step 2b: Context Summary Agent (pure YAML via chat_completion) ---------
 
   context_summary_agent:
-    _type: context_summary_agent
+    _type: chat_completion
     llm_name: nim_llm
-    description: "Summarize the NLI findings into concise context"
+    system_prompt: |
+      You are a Context Summary agent for a recommendation system.
+
+      You receive the output of an NLI (Natural Language Inference) evaluation
+      that scored candidate items against a user's query. Your job is to produce
+      a concise natural-language summary that a downstream Item Ranker agent
+      can use.
+
+      Your summary must include:
+      1. The original user query.
+      2. How many candidates were evaluated and the breakdown by NLI label
+         (entailment / neutral / contradiction).
+      3. The key themes or attributes that made top items align with the query.
+      4. Any notable mismatches or gaps in the candidate set.
+
+      Respond with ONLY a valid JSON object in this exact format:
+      {
+        "summary": "<your natural language summary paragraph>",
+        "top_aligned_items": ["<title1>", "<title2>"],
+        "key_themes": ["<theme1>", "<theme2>"],
+        "gaps": "<any gaps or missing categories noted>"
+      }
+
+  # -- Step 2c: User Understanding Agent (pure YAML, parallel with 2a-2b) ----
 
   user_understanding_agent:
-    _type: user_understanding_agent
+    _type: chat_completion
     llm_name: nim_llm
-    description: "Generate user preference summary from session context"
+    system_prompt: |
+      You are a User Understanding agent for a personalized recommendation system.
+
+      Given a user's query and the set of candidate items retrieved by RAG,
+      infer the user's preferences, interests, and intent. Think about:
+      - What product categories the user cares about.
+      - What attributes matter most (price, quality, brand, features, etc.).
+      - Whether the query implies short-term (session) needs or long-term interests.
+      - Any implicit constraints (budget, use-case, lifestyle).
+
+      Respond with ONLY a valid JSON object in this exact format:
+      {
+        "user_query": "<the original query>",
+        "preference_summary": "<a paragraph summarizing the user's preferences>",
+        "inferred_interests": {
+          "primary_category": "<main product category>",
+          "key_attributes": ["<attr1>", "<attr2>"],
+          "use_case": "<inferred use case>",
+          "price_sensitivity": "low | medium | high",
+          "session_vs_longterm": "session | longterm | both"
+        }
+      }
+
+  # -- Step 3: Item Ranker Agent (pure YAML via chat_completion) --------------
 
   item_ranker_agent:
-    _type: item_ranker_agent
+    _type: chat_completion
     llm_name: nim_llm
-    description: "Produce final ranked recommendations from combined signals"
+    system_prompt: |
+      You are an Item Ranker agent for a personalized recommendation system.
+
+      You receive two inputs merged into a single JSON object with two keys:
+      1. NLI pipeline output — a context summary of how well candidate items
+         align with the user's query (includes NLI labels, scores, and themes).
+      2. User understanding output — an analysis of the user's preferences,
+         interests, and intent.
+
+      Your task is to combine both signals and produce a final ranked list of
+      recommended items, ordered from most relevant to least relevant.
+
+      For each item, explain briefly why it was ranked at that position,
+      referencing both the NLI alignment and the user's preferences.
+
+      Respond with ONLY a valid JSON object in this exact format:
+      {
+        "ranked_recommendations": [
+          {
+            "rank": 1,
+            "title": "<item title>",
+            "category": "<item category>",
+            "relevance_score": 0.0,
+            "reasoning": "<why this item is ranked here>"
+          }
+        ],
+        "summary": "<brief paragraph summarizing the recommendation rationale>"
+      }
 
   # -- Composed control flow --------------------------------------------------
 
