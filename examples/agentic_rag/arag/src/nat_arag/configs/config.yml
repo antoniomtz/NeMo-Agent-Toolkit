@@ -1,0 +1,74 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# =============================================================================
+# ARAG: Agentic Retrieval-Augmented Generation for Personalized Recommendation
+# =============================================================================
+#
+# Workflow architecture:
+#
+#                           ┌──→ NLI Agent → Context Summary Agent ──┐
+#   User Query → RAG Retriever ──┤                                          ├──→ Item Ranker → Ranked Items
+#                           └──→ User Understanding Agent ────────────┘
+#
+# The parallel_executor fans out the RAG output to two branches that run
+# concurrently, then merges their results for the final Item Ranker step.
+
+functions:
+  # -- Core ARAG agents ------------------------------------------------------
+
+  rag_retriever:
+    _type: rag_retriever
+    top_k: 5
+    description: "Retrieve initial candidate items using RAG"
+
+  nli_agent:
+    _type: nli_agent
+    description: "Evaluate semantic alignment between candidates and user intent"
+
+  context_summary_agent:
+    _type: context_summary_agent
+    description: "Summarize the NLI findings into concise context"
+
+  user_understanding_agent:
+    _type: user_understanding_agent
+    description: "Generate user preference summary from session context"
+
+  item_ranker_agent:
+    _type: item_ranker_agent
+    description: "Produce final ranked recommendations from combined signals"
+
+  # -- Composed control flow --------------------------------------------------
+
+  # Sequential sub-pipeline: NLI → Context Summary
+  nli_pipeline:
+    _type: sequential_executor
+    tool_list: [nli_agent, context_summary_agent]
+    raise_type_incompatibility: false
+    description: "Evaluate candidates via NLI then summarize context"
+
+  # Parallel executor: runs nli_pipeline and user_understanding concurrently
+  parallel_analysis:
+    _type: parallel_executor
+    tool_list: [nli_pipeline, user_understanding_agent]
+    description: "Run NLI pipeline and user understanding analysis in parallel"
+
+# -- Main workflow: Sequential(RAG → Parallel → Ranker) ----------------------
+
+workflow:
+  _type: sequential_executor
+  tool_list: [rag_retriever, parallel_analysis, item_ranker_agent]
+  raise_type_incompatibility: false
+  description: "ARAG: Agentic RAG for Personalized Recommendation"
